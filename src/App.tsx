@@ -3,6 +3,7 @@ import {
   Activity,
   ArrowDownRight,
   ArrowRight,
+  Bell,
   Check,
   ChevronDown,
   Clock3,
@@ -14,6 +15,7 @@ import {
   LogOut,
   Menu,
   Plus,
+  Pencil,
   Search,
   Sparkles,
   Trophy,
@@ -24,6 +26,13 @@ import {
 type User = { id: number; username: string; balance: number };
 type Leader = User & { wins: number };
 type Invite = { code: string; createdAt: string; expiresAt: string; redeemedCount: number };
+type NotificationPreferences = { newPolls: boolean; participatedResolutions: boolean };
+type NotificationSettings = {
+  pushEnabled: boolean;
+  publicKey: string | null;
+  hasSubscription: boolean;
+  preferences: NotificationPreferences;
+};
 type OptionStat = { count: number; staked: number; odds: number };
 type Bet = { choiceIndex: number; amount: number; odds: number };
 type Market = {
@@ -34,6 +43,7 @@ type Market = {
   options: string[];
   outcomeIndex: number | null;
   status: 'open' | 'resolved';
+  cancelledAt: string | null;
   endsAt: string;
   createdAt: string;
   creator: string;
@@ -102,7 +112,9 @@ export default function App() {
   const [networkError, setNetworkError] = useState('');
   const [authMode, setAuthMode] = useState<AuthMode | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingMarket, setEditingMarket] = useState<Market | null>(null);
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [activeCategory, setActiveCategory] = useState('All');
   const [activeFilter, setActiveFilter] = useState<MarketListFilter>('all');
   const [sortBy, setSortBy] = useState<'newest' | 'popular'>('newest');
@@ -165,7 +177,7 @@ export default function App() {
 
   const openCount = markets.filter((market) => market.status === 'open' && new Date(market.endsAt).getTime() > now).length;
   const awaitingCount = markets.filter((market) => market.status === 'open' && new Date(market.endsAt).getTime() <= now).length;
-  const totalPool = markets.reduce((sum, market) => sum + market.totalStaked, 0);
+  const totalPool = markets.reduce((sum, market) => sum + (market.status === 'open' ? market.totalStaked : 0), 0);
 
   async function handleAuth(mode: AuthMode, values: Record<string, string>) {
     const path = mode === 'register' ? '/api/auth/register' : '/api/auth/login';
@@ -239,6 +251,26 @@ export default function App() {
     await refresh();
   }
 
+  async function editMarket(marketId: string, values: {
+    title: string;
+    description: string;
+    category: string;
+    endsAt: string;
+  }) {
+    await request(`/api/markets/${marketId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(values),
+    });
+    setEditingMarket(null);
+    await refresh();
+  }
+
+  async function cancelMarket(marketId: string) {
+    const result = await request<{ user: User }>(`/api/markets/${marketId}/cancel`, { method: 'POST' });
+    setUser(result.user);
+    await refresh();
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -252,6 +284,7 @@ export default function App() {
             <>
               <div className="balance-pill"><Coins size={16} /><span>{formatCredits(user.balance)}</span><small>CR</small></div>
               <button className="button invite-button" title="Create an invite link" aria-label="Create an invite link" onClick={() => setInviteOpen(true)}><UserRoundPlus size={15} /><span>Invite</span></button>
+              <button className="button notification-button" title="Notification settings" aria-label="Notification settings" onClick={() => setNotificationsOpen(true)}><Bell size={16} /><span>Alerts</span></button>
               <div className="user-menu">
                 <span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span>
                 <span className="user-name">{user.username}</span>
@@ -384,6 +417,8 @@ export default function App() {
                   now={now}
                   onBet={placeBet}
                   onResolve={resolveMarket}
+                  onEdit={setEditingMarket}
+                  onCancel={cancelMarket}
                   onSignIn={() => setAuthMode('login')}
                 />
               )) : (
@@ -465,7 +500,9 @@ export default function App() {
 
       {authMode && <AuthModal mode={authMode} initialInviteCode={new URLSearchParams(window.location.search).get('invite') ?? ''} onModeChange={setAuthMode} onClose={() => setAuthMode(null)} onSubmit={handleAuth} />}
       {createOpen && <CreateMarketModal onClose={() => setCreateOpen(false)} onSubmit={createMarket} />}
+      {editingMarket && <EditMarketModal market={editingMarket} onClose={() => setEditingMarket(null)} onSubmit={editMarket} />}
       {inviteOpen && user && <InviteModal invites={invites} onCreate={createInvite} onClose={() => setInviteOpen(false)} />}
+      {notificationsOpen && user && <NotificationSettingsModal onClose={() => setNotificationsOpen(false)} />}
     </div>
   );
 }
@@ -476,6 +513,8 @@ function MarketCard({
   now,
   onBet,
   onResolve,
+  onEdit,
+  onCancel,
   onSignIn,
 }: {
   market: Market;
@@ -483,16 +522,21 @@ function MarketCard({
   now: number;
   onBet: (marketId: string, choiceIndex: number, amount: number) => Promise<void>;
   onResolve: (marketId: string, outcomeIndex: number) => Promise<void>;
+  onEdit: (market: Market) => void;
+  onCancel: (marketId: string) => Promise<void>;
   onSignIn: () => void;
 }) {
   const [selectedChoice, setSelectedChoice] = useState<number | null>(null);
   const [stake, setStake] = useState('50');
   const [resolveChoice, setResolveChoice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState('');
+  const cancelledAt = market.cancelledAt;
   const expired = new Date(market.endsAt).getTime() <= now;
-  const resolved = market.status === 'resolved';
-  const canBet = !expired && !resolved && !market.myBet && Boolean(user);
+  const cancelled = cancelledAt !== null;
+  const resolved = market.status === 'resolved' && !cancelled;
+  const canBet = !expired && market.status === 'open' && !market.myBet && Boolean(user);
   const stakeNumber = Number(stake);
   const optionTotal = market.optionStats.reduce((sum, option) => sum + option.count, 0);
 
@@ -542,17 +586,36 @@ function MarketCard({
     }
   }
 
+  async function cancelPoll() {
+    if (!window.confirm('Cancel this poll and refund every caller’s original stake? The poll and its pick history will remain visible as cancelled.')) return;
+    setCancelling(true);
+    setError('');
+    try {
+      await onCancel(market.id);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not cancel this poll.');
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   return (
     <article className="market-card">
       <div className="market-card-top">
         <div className="market-category"><span className={`category-square category-${market.category.toLowerCase()}`} />{market.category}</div>
-        <div className={`market-status${resolved ? ' status-settled' : expired ? ' status-awaiting' : ' status-live'}`}>
-          <span />{resolved ? 'Settled' : expired ? 'Awaiting result' : 'Open'}
+        <div className={`market-status${cancelled || resolved ? ' status-settled' : expired ? ' status-awaiting' : ' status-live'}`}>
+          <span />{cancelled ? 'Cancelled' : resolved ? 'Settled' : expired ? 'Awaiting result' : 'Open'}
         </div>
       </div>
       <h3 className="market-title">{market.title}</h3>
       {market.description && <p className="market-description">{market.description}</p>}
-      <div className="market-meta"><span>By <strong>{market.creator}</strong></span><span className="meta-separator">·</span><span><Clock3 size={13} />{resolved ? `Ended ${formatDeadline(market.endsAt)}` : timeRemaining(market.endsAt, now)}</span></div>
+      <div className="market-meta"><span>By <strong>{market.creator}</strong></span><span className="meta-separator">·</span><span><Clock3 size={13} />{cancelledAt ? `Cancelled ${formatDeadline(cancelledAt)}` : resolved ? `Ended ${formatDeadline(market.endsAt)}` : timeRemaining(market.endsAt, now)}</span></div>
+      {market.status === 'open' && user?.id === market.creatorId && (
+        <div className="market-owner-actions">
+          <button className="market-edit-button" onClick={() => onEdit(market)}><Pencil size={13} /> Edit poll</button>
+          <button className="market-cancel-button" onClick={() => void cancelPoll()} disabled={cancelling}><X size={13} />{cancelling ? 'Refunding...' : 'Cancel & refund'}</button>
+        </div>
+      )}
 
       <div className={`outcome-grid${market.options.length > 2 ? ' outcome-grid-many' : ''}`}>
         {market.options.map((option, index) => {
@@ -567,7 +630,7 @@ function MarketCard({
                 if (canBet) setSelectedChoice(index);
                 else if (!user && !expired && !resolved) setSelectedChoice(index);
               }}
-              disabled={resolved || expired || Boolean(market.myBet)}
+              disabled={market.status === 'resolved' || expired || Boolean(market.myBet)}
               aria-pressed={selectedChoice === index}
             >
               <span className="outcome-label"><span>{option}{isWinner && <Check size={14} />}</span><span className="outcome-odds">{stat.odds.toFixed(2)}×</span></span>
@@ -579,9 +642,10 @@ function MarketCard({
       </div>
 
       {market.myBet && (
-        <div className={`position-note${resolved ? market.myBet.choiceIndex === market.outcomeIndex ? ' position-won' : ' position-lost' : ''}`}>
-          <span>{resolved ? market.myBet.choiceIndex === market.outcomeIndex ? 'PICK HIT' : 'PICK MISSED' : 'YOUR POSITION'}</span>
+        <div className={`position-note${cancelled ? ' position-refunded' : resolved ? market.myBet.choiceIndex === market.outcomeIndex ? ' position-won' : ' position-lost' : ''}`}>
+          <span>{cancelled ? 'STAKE REFUNDED' : resolved ? market.myBet.choiceIndex === market.outcomeIndex ? 'PICK HIT' : 'PICK MISSED' : 'YOUR POSITION'}</span>
           <strong>{market.options[market.myBet.choiceIndex]} · {formatCredits(market.myBet.amount)} CR at {market.myBet.odds.toFixed(2)}×</strong>
+          {cancelled && <span className="position-return">{formatCredits(market.myBet.amount)} CR returned</span>}
           {resolved && market.myBet.choiceIndex === market.outcomeIndex && <span className="position-return">+{formatCredits(Math.floor(market.myBet.amount * market.myBet.odds))} CR returned</span>}
         </div>
       )}
@@ -607,9 +671,9 @@ function MarketCard({
         </form>
       )}
 
-      {!resolved && expired && (
+      {market.status === 'open' && (
         <form className="resolve-form" onSubmit={(event) => void submitResolution(event)}>
-          <div className="resolve-copy"><strong>Time to call it.</strong><span>Which outcome happened?</span></div>
+          <div className="resolve-copy"><strong>{expired ? 'Time to call it.' : 'End this poll early?'}</strong><span>{expired ? 'Which outcome happened?' : 'Anyone signed in can resolve this poll now.'}</span></div>
           <label className="resolve-select-wrap">
             <select aria-label="Choose the outcome that happened" value={resolveChoice} onChange={(event) => setResolveChoice(event.target.value)}>
               <option value="">Select result</option>
@@ -622,7 +686,7 @@ function MarketCard({
 
       {error && <div className="form-error inline-error" role="alert">{error}</div>}
 
-      <div className="market-card-footer"><span><Coins size={14} /> {formatCredits(market.totalStaked)} CR in play</span><span>{market.bettorsCount} {market.bettorsCount === 1 ? 'caller' : 'callers'}</span>{resolved && <span className="resolved-outcome">Result: {market.options[market.outcomeIndex ?? 0]}</span>}</div>
+      <div className="market-card-footer"><span><Coins size={14} /> {formatCredits(market.totalStaked)} CR {cancelled ? 'refunded' : 'in play'}</span><span>{market.bettorsCount} {market.bettorsCount === 1 ? 'caller' : 'callers'}</span>{resolved && <span className="resolved-outcome">Result: {market.options[market.outcomeIndex ?? 0]}</span>}</div>
     </article>
   );
 }
@@ -767,6 +831,235 @@ function InviteModal({
         ) : (
           <div className="invite-empty">No invites yet. Create a reusable link for new members.</div>
         )}
+      </section>
+    </div>
+  );
+}
+
+function urlBase64ToUint8Array(value: string) {
+  const padding = '='.repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(window.atob(base64), (character) => character.charCodeAt(0));
+}
+
+function NotificationSettingsModal({ onClose }: { onClose: () => void }) {
+  const [settings, setSettings] = useState<NotificationSettings | null>(null);
+  const [subscription, setSubscription] = useState<PushSubscription | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        const result = await request<NotificationSettings>('/api/notifications/settings');
+        const registration = 'serviceWorker' in navigator
+          ? await navigator.serviceWorker.getRegistration()
+          : undefined;
+        const existingSubscription = registration ? await registration.pushManager.getSubscription() : null;
+        if (active) {
+          setSettings(result);
+          setSubscription(existingSubscription);
+        }
+      } catch (requestError) {
+        if (active) setError(requestError instanceof Error ? requestError.message : 'Could not load notification settings.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    void load();
+    return () => { active = false; };
+  }, []);
+
+  async function enablePush() {
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      if (!settings?.pushEnabled || !settings.publicKey) {
+        throw new Error('Browser push is not configured on this server yet.');
+      }
+      if (!window.isSecureContext) {
+        throw new Error('Browser push requires HTTPS (except on localhost).');
+      }
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+        throw new Error('This browser does not support push notifications.');
+      }
+      const permission = Notification.permission === 'default'
+        ? await Notification.requestPermission()
+        : Notification.permission;
+      if (permission !== 'granted') throw new Error('Allow notifications in your browser settings to enable push.');
+
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+      const nextSubscription = await registration.pushManager.getSubscription()
+        ?? await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(settings.publicKey),
+        });
+      await request('/api/notifications/subscriptions', {
+        method: 'POST',
+        body: JSON.stringify(nextSubscription.toJSON()),
+      });
+      setSubscription(nextSubscription);
+      setSettings((current) => current ? { ...current, hasSubscription: true } : current);
+      setMessage('Push is enabled on this browser. Choose which updates you want below.');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not enable browser push.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updatePreferences(key: keyof NotificationPreferences, value: boolean) {
+    if (!settings) return;
+    setBusy(true);
+    setError('');
+    setMessage('');
+    const preferences = { ...settings.preferences, [key]: value };
+    try {
+      await request('/api/notifications/preferences', {
+        method: 'PUT',
+        body: JSON.stringify(preferences),
+      });
+      setSettings({ ...settings, preferences });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save notification preferences.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disableThisBrowser() {
+    if (!subscription || !settings) return;
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const result = await request<{ hasSubscription: boolean }>('/api/notifications/subscriptions', {
+        method: 'DELETE',
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      });
+      await subscription.unsubscribe();
+      setSubscription(null);
+      setSettings({ ...settings, hasSubscription: result.hasSubscription });
+      setMessage('Push has been disabled on this browser.');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not disable push on this browser.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const unsupported = !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window);
+  const secureContext = window.isSecureContext;
+  const permissionDenied = 'Notification' in window && Notification.permission === 'denied';
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="dialog notification-dialog" role="dialog" aria-modal="true" aria-labelledby="notification-title">
+        <button className="dialog-close icon-button" onClick={onClose} aria-label="Close"><X size={19} /></button>
+        <div className="dialog-mark"><Bell size={18} /></div>
+        <div className="eyebrow dialog-eyebrow">YOUR ALERTS</div>
+        <h2 id="notification-title">Stay in the loop.</h2>
+        <p className="dialog-intro">Choose which moments should send a browser notification.</p>
+        {loading ? <div className="invite-empty">Loading notification settings...</div> : (
+          <>
+            {!settings?.pushEnabled && <div className="notification-note">Push is not configured on this server. The administrator needs to add VAPID settings.</div>}
+            {settings?.pushEnabled && (!secureContext || unsupported) && <div className="notification-note">Push requires a supported browser and HTTPS. Localhost is allowed for development.</div>}
+            {permissionDenied && <div className="notification-note">Notifications are blocked by this browser. Allow them in the site settings, then try again.</div>}
+            {settings?.pushEnabled && secureContext && !unsupported && (
+              <div className="notification-device-row">
+                <span>{subscription ? 'This browser is connected' : settings.hasSubscription ? 'Another browser is connected' : 'No browser is connected'}</span>
+                {subscription
+                  ? <button className="market-cancel-button" onClick={() => void disableThisBrowser()} disabled={busy}>Disable this browser</button>
+                  : <button className="button button-dark notification-enable" onClick={() => void enablePush()} disabled={busy}>{busy ? 'Connecting...' : 'Enable browser push'}</button>}
+              </div>
+            )}
+            <label className="notification-option">
+              <input
+                type="checkbox"
+                checked={settings?.preferences.newPolls ?? false}
+                disabled={busy || !subscription || !settings?.pushEnabled}
+                onChange={(event) => void updatePreferences('newPolls', event.target.checked)}
+              />
+              <span><strong>New polls</strong><small>When someone creates a poll.</small></span>
+            </label>
+            <label className="notification-option">
+              <input
+                type="checkbox"
+                checked={settings?.preferences.participatedResolutions ?? false}
+                disabled={busy || !subscription || !settings?.pushEnabled}
+                onChange={(event) => void updatePreferences('participatedResolutions', event.target.checked)}
+              />
+              <span><strong>Polls I joined are resolved</strong><small>When a poll you picked in is settled.</small></span>
+            </label>
+          </>
+        )}
+        {error && <div className="form-error notification-message" role="alert">{error}</div>}
+        {message && <div className="notification-success" role="status">{message}</div>}
+      </section>
+    </div>
+  );
+}
+
+function EditMarketModal({
+  market,
+  onClose,
+  onSubmit,
+}: {
+  market: Market;
+  onClose: () => void;
+  onSubmit: (marketId: string, values: { title: string; description: string; category: string; endsAt: string }) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const minimumEnd = localDateTime(new Date(Date.now() + 60_000));
+
+  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const title = String(form.get('title') ?? '').trim();
+    const description = String(form.get('description') ?? '').trim();
+    const category = String(form.get('category') ?? '');
+    const endsAt = String(form.get('endsAt') ?? '');
+    if (title.length < 8) {
+      setError('Make the question at least 8 characters long.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      await onSubmit(market.id, { title, description, category, endsAt: new Date(endsAt).toISOString() });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not edit this poll.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="dialog create-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-title">
+        <button className="dialog-close icon-button" onClick={onClose} aria-label="Close"><X size={19} /></button>
+        <div className="dialog-mark"><Pencil size={17} /></div>
+        <div className="eyebrow dialog-eyebrow">UPDATE YOUR POLL</div>
+        <h2 id="edit-title">Edit the details.</h2>
+        <p className="dialog-intro">Answer choices stay fixed so existing picks keep their meaning.</p>
+        <form className="dialog-form create-form" onSubmit={(event) => void handleSubmit(event)}>
+          <label>YOUR QUESTION<input name="title" defaultValue={market.title} minLength={8} maxLength={100} required /></label>
+          <label>CONTEXT <span className="optional-label">OPTIONAL</span><textarea name="description" defaultValue={market.description} rows={2} maxLength={280} /></label>
+          <div className="form-two-col">
+            <label>TOPIC<select name="category" defaultValue={market.category}><option>Community</option><option>Culture</option><option>Sports</option><option>Technology</option><option>Politics</option><option>Science</option></select><ChevronDown size={14} /></label>
+            <label>MARKET CLOSES<input name="endsAt" type="datetime-local" min={minimumEnd} defaultValue={localDateTime(new Date(market.endsAt))} required /></label>
+          </div>
+          {error && <div className="form-error" role="alert">{error}</div>}
+          <button className="button button-dark dialog-submit" type="submit" disabled={busy}>
+            {busy ? 'Saving...' : 'Save poll'} <Check size={15} />
+          </button>
+        </form>
       </section>
     </div>
   );

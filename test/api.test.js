@@ -26,9 +26,9 @@ async function availablePort() {
   return port;
 }
 
-async function call(endpoint, { body, cookie } = {}) {
+async function call(endpoint, { body, cookie, method } = {}) {
   const response = await fetch(`${baseUrl}${endpoint}`, {
-    method: body ? 'POST' : 'GET',
+    method: method ?? (body ? 'POST' : 'GET'),
     headers: {
       'Content-Type': 'application/json',
       ...(cookie ? { Cookie: cookie } : {}),
@@ -72,7 +72,14 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${port}`;
   serverProcess = spawn(process.execPath, [path.join(root, 'server', 'index.js')], {
     cwd: root,
-    env: { ...process.env, PORT: String(port), DB_PATH: databasePath },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_PATH: databasePath,
+      VAPID_PUBLIC_KEY: '',
+      VAPID_PRIVATE_KEY: '',
+      VAPID_SUBJECT: '',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   serverProcess.stdout.on('data', (chunk) => { serverOutput += chunk; });
@@ -117,6 +124,8 @@ test('members create markets, place one wager, and receive the correct payout', 
   assert.equal(hiddenLeaderboard.status, 401);
   const hiddenInvites = await call('/api/invites');
   assert.equal(hiddenInvites.status, 401);
+  const hiddenNotificationSettings = await call('/api/notifications/settings');
+  assert.equal(hiddenNotificationSettings.status, 401);
   const missingInvite = await call('/api/auth/register', {
     body: {
       username: `blocked_${stamp}`,
@@ -137,9 +146,45 @@ test('members create markets, place one wager, and receive the correct payout', 
   assert.equal(creator.status, 201);
   assert.equal(creator.data.user.balance, 1000);
 
+  const notificationSettings = await call('/api/notifications/settings', { cookie: creator.cookie });
+  assert.equal(notificationSettings.status, 200);
+  assert.equal(notificationSettings.data.pushEnabled, false);
+  assert.deepEqual(notificationSettings.data.preferences, {
+    newPolls: false,
+    participatedResolutions: false,
+  });
+  const malformedPreferences = await call('/api/notifications/preferences', {
+    cookie: creator.cookie,
+    body: { newPolls: true },
+    method: 'PUT',
+  });
+  assert.equal(malformedPreferences.status, 400);
+  const savedPreferences = await call('/api/notifications/preferences', {
+    cookie: creator.cookie,
+    body: { newPolls: true, participatedResolutions: true },
+    method: 'PUT',
+  });
+  assert.equal(savedPreferences.status, 200);
+  const unavailablePushSubscription = await call('/api/notifications/subscriptions', {
+    cookie: creator.cookie,
+    body: {
+      endpoint: 'https://push.example.test/subscription',
+      keys: { p256dh: 'public-key', auth: 'auth-key' },
+    },
+  });
+  assert.equal(unavailablePushSubscription.status, 503);
+  await call('/api/notifications/preferences', {
+    cookie: creator.cookie,
+    body: { newPolls: false, participatedResolutions: false },
+    method: 'PUT',
+  });
+
   const migratedDatabase = new Database(databasePath);
   assert.ok(migratedDatabase.pragma('table_info(bets)').some((column) => column.name === 'decimal_odds'));
   assert.ok(migratedDatabase.pragma('table_info(invite_codes)').some((column) => column.name === 'expires_at'));
+  assert.ok(migratedDatabase.pragma('table_info(markets)').some((column) => column.name === 'cancelled_at'));
+  assert.ok(migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'push_subscriptions'").get());
+  assert.ok(migratedDatabase.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_preferences'").get());
   migratedDatabase.close();
   const reusedBootstrap = await call('/api/auth/register', {
     body: {
@@ -175,6 +220,18 @@ test('members create markets, place one wager, and receive the correct payout', 
     },
   });
   assert.equal(marketResponse.status, 201);
+  const editedMarket = await call(`/api/markets/${marketResponse.data.id}`, {
+    method: 'PATCH',
+    cookie: creator.cookie,
+    body: {
+      title: 'Will this edited integration test resolve?',
+      description: 'Updated market context.',
+      category: 'Technology',
+      endsAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      options: ['Ignored choice change', 'Choices are fixed'],
+    },
+  });
+  assert.equal(editedMarket.status, 200);
 
   const multichoiceResponse = await call('/api/markets', {
     cookie: creator.cookie,
@@ -207,6 +264,17 @@ test('members create markets, place one wager, and receive the correct payout', 
     },
   });
   assert.equal(bettor.status, 201);
+  const forbiddenEdit = await call(`/api/markets/${marketResponse.data.id}`, {
+    method: 'PATCH',
+    cookie: bettor.cookie,
+    body: {
+      title: 'Unauthorized market edit attempt',
+      description: '',
+      category: 'Community',
+      endsAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+    },
+  });
+  assert.equal(forbiddenEdit.status, 403);
 
   const secondInvitee = await call('/api/auth/register', {
     body: {
@@ -258,13 +326,8 @@ test('members create markets, place one wager, and receive the correct payout', 
   });
   assert.equal(duplicateBet.status, 409);
 
-  const database = new Database(databasePath);
-  database.prepare('UPDATE markets SET ends_at = ? WHERE id = ?')
-    .run(new Date(Date.now() - 1000).toISOString(), marketResponse.data.id);
-  database.close();
-
   const resolved = await call(`/api/markets/${marketResponse.data.id}/resolve`, {
-    cookie: creator.cookie,
+    cookie: bettor.cookie,
     body: { outcomeIndex: 0 },
   });
   assert.equal(resolved.status, 200);
@@ -279,7 +342,65 @@ test('members create markets, place one wager, and receive the correct payout', 
   const resolvedMarket = markets.data.markets.find((market) => market.id === marketResponse.data.id);
   const multichoiceMarket = markets.data.markets.find((market) => market.id === multichoiceResponse.data.id);
   assert.equal(resolvedMarket.status, 'resolved');
+  assert.equal(resolvedMarket.title, 'Will this edited integration test resolve?');
+  assert.equal(resolvedMarket.description, 'Updated market context.');
+  assert.equal(resolvedMarket.category, 'Technology');
+  assert.deepEqual(resolvedMarket.options, ['Yes', 'No']);
   assert.equal(resolvedMarket.myBet.odds, 1.5);
   assert.equal(resolvedMarket.optionStats[0].odds, 1.33);
   assert.deepEqual(multichoiceMarket.options, ['One', 'Two', 'Three']);
+
+  const cancelableMarket = await call('/api/markets', {
+    cookie: creator.cookie,
+    body: {
+      title: 'Will this poll be cancelled and refunded?',
+      description: '',
+      category: 'Community',
+      options: ['Yes', 'No'],
+      endsAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+    },
+  });
+  assert.equal(cancelableMarket.status, 201);
+  const creatorPick = await call(`/api/markets/${cancelableMarket.data.id}/bets`, {
+    cookie: creator.cookie,
+    body: { choiceIndex: 0, amount: 30 },
+  });
+  const callerPick = await call(`/api/markets/${cancelableMarket.data.id}/bets`, {
+    cookie: bettor.cookie,
+    body: { choiceIndex: 1, amount: 40 },
+  });
+  assert.equal(creatorPick.status, 200);
+  assert.equal(callerPick.status, 200);
+
+  const unauthorizedCancel = await call(`/api/markets/${cancelableMarket.data.id}/cancel`, {
+    method: 'POST',
+    cookie: bettor.cookie,
+  });
+  assert.equal(unauthorizedCancel.status, 403);
+
+  const cancelled = await call(`/api/markets/${cancelableMarket.data.id}/cancel`, {
+    method: 'POST',
+    cookie: creator.cookie,
+  });
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.data.refundedCredits, 70);
+  assert.equal(cancelled.data.refundedCallers, 2);
+  assert.equal(cancelled.data.user.balance, creatorPick.data.user.balance + 30);
+  const refundedCaller = await call('/api/me', { cookie: bettor.cookie });
+  assert.equal(refundedCaller.data.user.balance, callerPick.data.user.balance + 40);
+
+  const cancellationDatabase = new Database(databasePath);
+  assert.equal(cancellationDatabase.prepare('SELECT COUNT(*) AS count FROM bets WHERE market_id = ?')
+    .get(cancelableMarket.data.id).count, 2);
+  cancellationDatabase.close();
+  const cancelledMarket = (await call('/api/markets', { cookie: bettor.cookie }))
+    .data.markets.find((market) => market.id === cancelableMarket.data.id);
+  assert.equal(cancelledMarket.status, 'resolved');
+  assert.ok(cancelledMarket.cancelledAt);
+  assert.equal(cancelledMarket.totalStaked, 70);
+  const repeatedCancel = await call(`/api/markets/${cancelableMarket.data.id}/cancel`, {
+    method: 'POST',
+    cookie: creator.cookie,
+  });
+  assert.equal(repeatedCancel.status, 409);
 });

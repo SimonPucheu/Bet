@@ -5,6 +5,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import webPush from 'web-push';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, '..');
@@ -52,7 +53,8 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
     ends_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    creator_id INTEGER NOT NULL REFERENCES users(id)
+    creator_id INTEGER NOT NULL REFERENCES users(id),
+    cancelled_at TEXT
   );
   CREATE TABLE IF NOT EXISTS bets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,9 +66,27 @@ db.exec(`
     created_at TEXT NOT NULL,
     UNIQUE (market_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
+  CREATE TABLE IF NOT EXISTS notification_preferences (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    new_polls INTEGER NOT NULL DEFAULT 0 CHECK (new_polls IN (0, 1)),
+    participated_resolutions INTEGER NOT NULL DEFAULT 0 CHECK (participated_resolutions IN (0, 1))
+  );
   CREATE INDEX IF NOT EXISTS idx_markets_status_ends ON markets(status, ends_at);
   CREATE INDEX IF NOT EXISTS idx_bets_market ON bets(market_id);
 `);
+
+const marketColumns = db.pragma('table_info(markets)');
+if (!marketColumns.some((column) => column.name === 'cancelled_at')) {
+  db.exec('ALTER TABLE markets ADD COLUMN cancelled_at TEXT');
+}
 
 const inviteColumns = db.pragma('table_info(invite_codes)');
 if (!inviteColumns.some((column) => column.name === 'expires_at')) {
@@ -116,6 +136,15 @@ if (!hasUsers && !bootstrapInvite) {
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const categories = new Set(['Culture', 'Sports', 'Technology', 'Politics', 'Community', 'Science']);
+const vapidPublicKey = process.env.VAPID_PUBLIC_KEY?.trim() ?? '';
+const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY?.trim() ?? '';
+const vapidSubject = process.env.VAPID_SUBJECT?.trim() ?? '';
+const pushConfiguration = [vapidPublicKey, vapidPrivateKey, vapidSubject];
+if (pushConfiguration.some(Boolean) && pushConfiguration.some((value) => !value)) {
+  throw new Error('Set VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, and VAPID_SUBJECT together to enable Web Push.');
+}
+const pushEnabled = pushConfiguration.every(Boolean);
+if (pushEnabled) webPush.setVapidDetails(vapidSubject, vapidPublicKey, vapidPrivateKey);
 app.use(express.json({ limit: '32kb' }));
 
 function digest(value) {
@@ -160,6 +189,61 @@ function setSession(response, userId) {
 
 function publicUser(user) {
   return { id: user.id, username: user.username, balance: user.balance };
+}
+
+async function sendPushNotifications(subscriptions, payload) {
+  await Promise.all(subscriptions.map(async (subscription) => {
+    try {
+      await webPush.sendNotification({
+        endpoint: subscription.endpoint,
+        keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+      }, JSON.stringify(payload));
+    } catch (error) {
+      if (error.statusCode === 404 || error.statusCode === 410) {
+        db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(subscription.endpoint);
+        return;
+      }
+      console.error('Web Push delivery failed:', error);
+    }
+  }));
+}
+
+function dispatchPushNotifications(subscriptions, payload) {
+  void sendPushNotifications(subscriptions, payload)
+    .catch((error) => console.error('Could not complete Web Push delivery:', error));
+}
+
+function notifyNewPoll(market, creatorId) {
+  if (!pushEnabled) return;
+  const subscriptions = db.prepare(`
+    SELECT push_subscriptions.endpoint, push_subscriptions.p256dh, push_subscriptions.auth
+    FROM push_subscriptions
+    JOIN notification_preferences ON notification_preferences.user_id = push_subscriptions.user_id
+    WHERE notification_preferences.new_polls = 1 AND push_subscriptions.user_id != ?
+  `).all(creatorId);
+  dispatchPushNotifications(subscriptions, {
+    title: 'A new poll is up',
+    body: market.title,
+    marketId: market.id,
+    type: 'new-poll',
+  });
+}
+
+function notifyPollResolved(marketId, title) {
+  if (!pushEnabled) return;
+  const subscriptions = db.prepare(`
+    SELECT DISTINCT push_subscriptions.endpoint, push_subscriptions.p256dh, push_subscriptions.auth
+    FROM push_subscriptions
+    JOIN notification_preferences ON notification_preferences.user_id = push_subscriptions.user_id
+    JOIN bets ON bets.user_id = push_subscriptions.user_id
+    WHERE notification_preferences.participated_resolutions = 1 AND bets.market_id = ?
+  `).all(marketId);
+  dispatchPushNotifications(subscriptions, {
+    title: 'A poll you joined was resolved',
+    body: title,
+    marketId,
+    type: 'poll-resolved',
+  });
 }
 
 app.get('/api/me', (request, response) => {
@@ -262,6 +346,80 @@ app.post('/api/invites', requireUser, (request, response) => {
   response.status(201).json({ invite: { code, createdAt, expiresAt, redeemedCount: 0 } });
 });
 
+app.get('/api/notifications/settings', requireUser, (request, response) => {
+  const preferences = db.prepare(`
+    SELECT new_polls AS newPolls, participated_resolutions AS participatedResolutions
+    FROM notification_preferences WHERE user_id = ?
+  `).get(request.user.id) ?? { newPolls: 0, participatedResolutions: 0 };
+  const subscription = db.prepare('SELECT 1 FROM push_subscriptions WHERE user_id = ? LIMIT 1')
+    .get(request.user.id);
+  response.json({
+    pushEnabled,
+    publicKey: pushEnabled ? vapidPublicKey : null,
+    hasSubscription: Boolean(subscription),
+    preferences: {
+      newPolls: Boolean(preferences.newPolls),
+      participatedResolutions: Boolean(preferences.participatedResolutions),
+    },
+  });
+});
+
+app.put('/api/notifications/preferences', requireUser, (request, response) => {
+  const { newPolls, participatedResolutions } = request.body;
+  if (typeof newPolls !== 'boolean' || typeof participatedResolutions !== 'boolean') {
+    return response.status(400).json({ error: 'Set both notification preferences to true or false.' });
+  }
+  db.prepare(`
+    INSERT INTO notification_preferences (user_id, new_polls, participated_resolutions)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET new_polls = excluded.new_polls,
+      participated_resolutions = excluded.participated_resolutions
+  `).run(request.user.id, Number(newPolls), Number(participatedResolutions));
+  response.json({ preferences: { newPolls, participatedResolutions } });
+});
+
+app.post('/api/notifications/subscriptions', requireUser, (request, response) => {
+  if (!pushEnabled) {
+    return response.status(503).json({ error: 'Browser push is not configured on this server.' });
+  }
+  const { endpoint, keys } = request.body;
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch {
+    return response.status(400).json({ error: 'Provide a valid push subscription.' });
+  }
+  if (parsedEndpoint.protocol !== 'https:' || typeof keys?.p256dh !== 'string' || !keys.p256dh
+    || typeof keys?.auth !== 'string' || !keys.auth) {
+    return response.status(400).json({ error: 'Provide a valid push subscription.' });
+  }
+  db.prepare(`
+    INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id,
+      p256dh = excluded.p256dh, auth = excluded.auth
+  `).run(parsedEndpoint.href, request.user.id, keys.p256dh, keys.auth, new Date().toISOString());
+  response.status(201).json({ ok: true });
+});
+
+app.delete('/api/notifications/subscriptions', requireUser, (request, response) => {
+  const { endpoint } = request.body;
+  let parsedEndpoint;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch {
+    return response.status(400).json({ error: 'Provide a valid push subscription.' });
+  }
+  if (parsedEndpoint.protocol !== 'https:') {
+    return response.status(400).json({ error: 'Provide a valid push subscription.' });
+  }
+  db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?')
+    .run(parsedEndpoint.href, request.user.id);
+  const hasSubscription = Boolean(db.prepare('SELECT 1 FROM push_subscriptions WHERE user_id = ? LIMIT 1')
+    .get(request.user.id));
+  response.json({ ok: true, hasSubscription });
+});
+
 app.get('/api/markets', requireUser, (request, response) => {
   const user = request.user;
   const markets = db.prepare(`
@@ -306,6 +464,7 @@ app.get('/api/markets', requireUser, (request, response) => {
         options,
         outcomeIndex: market.outcome_index,
         status: market.status,
+        cancelledAt: market.cancelled_at,
         endsAt: market.ends_at,
         createdAt: market.created_at,
         creator: market.creator_name,
@@ -364,7 +523,37 @@ app.post('/api/markets', requireUser, (request, response) => {
     id, title.trim(), description.trim(), category, JSON.stringify(cleanOptions),
     new Date(expiry).toISOString(), new Date().toISOString(), request.user.id,
   );
+  notifyNewPoll({ id, title: title.trim() }, request.user.id);
   response.status(201).json({ id });
+});
+
+app.patch('/api/markets/:id', requireUser, (request, response) => {
+  const market = db.prepare('SELECT id, creator_id, status FROM markets WHERE id = ?').get(request.params.id);
+  if (!market) return response.status(404).json({ error: 'Market not found.' });
+  if (market.creator_id !== request.user.id) {
+    return response.status(403).json({ error: 'Only the market creator can edit this market.' });
+  }
+  if (market.status !== 'open') {
+    return response.status(409).json({ error: 'Resolved markets cannot be edited.' });
+  }
+
+  const { title, description, category, endsAt } = request.body;
+  if (typeof title !== 'string' || title.trim().length < 8 || title.trim().length > 100) {
+    return response.status(400).json({ error: 'Question must be between 8 and 100 characters.' });
+  }
+  if (typeof description !== 'string' || description.trim().length > 280) {
+    return response.status(400).json({ error: 'Description must be 280 characters or fewer.' });
+  }
+  if (!categories.has(category)) return response.status(400).json({ error: 'Choose a valid category.' });
+  const expiry = Date.parse(endsAt);
+  if (!Number.isFinite(expiry) || expiry < Date.now() + 60_000 || expiry > Date.now() + 90 * 24 * 60 * 60 * 1000) {
+    return response.status(400).json({ error: 'Choose an expiration from 1 minute to 90 days from now.' });
+  }
+
+  db.prepare(`
+    UPDATE markets SET title = ?, description = ?, category = ?, ends_at = ? WHERE id = ?
+  `).run(title.trim(), description.trim(), category, new Date(expiry).toISOString(), market.id);
+  response.json({ ok: true });
 });
 
 app.post('/api/markets/:id/bets', requireUser, (request, response) => {
@@ -413,12 +602,12 @@ app.post('/api/markets/:id/bets', requireUser, (request, response) => {
 
 app.post('/api/markets/:id/resolve', requireUser, (request, response) => {
   const outcomeIndex = Number(request.body.outcomeIndex);
+  let resolvedTitle;
   try {
     db.transaction(() => {
       const market = db.prepare('SELECT * FROM markets WHERE id = ?').get(request.params.id);
       if (!market) throw Object.assign(new Error('Market not found.'), { status: 404 });
       if (market.status === 'resolved') throw Object.assign(new Error('This market has already been resolved.'), { status: 409 });
-      if (Date.parse(market.ends_at) > Date.now()) throw Object.assign(new Error('This market can only be resolved after it expires.'), { status: 400 });
       const options = JSON.parse(market.options_json);
       if (!Number.isInteger(outcomeIndex) || outcomeIndex < 0 || outcomeIndex >= options.length) {
         throw Object.assign(new Error('Choose one of the listed outcomes.'), { status: 400 });
@@ -431,13 +620,56 @@ app.post('/api/markets/:id/resolve', requireUser, (request, response) => {
       for (const winner of winners) {
         credit.run(Math.floor(winner.amount * winner.decimal_odds), winner.user_id);
       }
+      resolvedTitle = market.title;
     })();
   } catch (error) {
     if (error.status) return response.status(error.status).json({ error: error.message });
     console.error(error);
     return response.status(500).json({ error: 'Could not resolve this market.' });
   }
+  notifyPollResolved(request.params.id, resolvedTitle);
   response.json({ user: publicUser(db.prepare('SELECT id, username, balance FROM users WHERE id = ?').get(request.user.id)) });
+});
+
+app.post('/api/markets/:id/cancel', requireUser, (request, response) => {
+  try {
+    const result = db.transaction(() => {
+      const market = db.prepare('SELECT id, creator_id, status FROM markets WHERE id = ?').get(request.params.id);
+      if (!market) throw Object.assign(new Error('Market not found.'), { status: 404 });
+      if (market.creator_id !== request.user.id) {
+        throw Object.assign(new Error('Only the market creator can cancel this market.'), { status: 403 });
+      }
+      if (market.status !== 'open') {
+        throw Object.assign(new Error('This market is already closed.'), { status: 409 });
+      }
+
+      const bets = db.prepare('SELECT user_id, amount FROM bets WHERE market_id = ?').all(market.id);
+      const refund = db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?');
+      for (const bet of bets) {
+        if (refund.run(bet.amount, bet.user_id).changes !== 1) {
+          throw new Error(`Could not refund user ${bet.user_id} for market ${market.id}.`);
+        }
+      }
+      const cancelledAt = new Date().toISOString();
+      const closed = db.prepare(`
+        UPDATE markets SET status = 'resolved', cancelled_at = ? WHERE id = ? AND status = 'open'
+      `).run(cancelledAt, market.id);
+      if (closed.changes !== 1) throw Object.assign(new Error('This market is already closed.'), { status: 409 });
+
+      return {
+        refundedCredits: bets.reduce((total, bet) => total + bet.amount, 0),
+        refundedCallers: bets.length,
+      };
+    })();
+    response.json({
+      ...result,
+      user: publicUser(db.prepare('SELECT id, username, balance FROM users WHERE id = ?').get(request.user.id)),
+    });
+  } catch (error) {
+    if (error.status) return response.status(error.status).json({ error: error.message });
+    console.error(error);
+    return response.status(500).json({ error: 'Could not cancel this market and refund its callers.' });
+  }
 });
 
 app.use('/api', (request, response) => response.status(404).json({ error: 'API route not found.' }));
