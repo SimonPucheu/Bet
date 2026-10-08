@@ -56,7 +56,16 @@ before(async () => {
       created_at TEXT NOT NULL,
       UNIQUE (market_id, user_id)
     );
+    CREATE TABLE invite_codes (
+      code TEXT PRIMARY KEY,
+      created_by INTEGER,
+      created_at TEXT NOT NULL,
+      redeemed_by INTEGER,
+      redeemed_at TEXT
+    );
   `);
+  legacyDatabase.prepare('INSERT INTO invite_codes (code, created_at) VALUES (?, ?)')
+    .run('LEGACY01', new Date().toISOString());
   legacyDatabase.close();
 
   const port = await availablePort();
@@ -130,6 +139,7 @@ test('members create markets, place one wager, and receive the correct payout', 
 
   const migratedDatabase = new Database(databasePath);
   assert.ok(migratedDatabase.pragma('table_info(bets)').some((column) => column.name === 'decimal_odds'));
+  assert.ok(migratedDatabase.pragma('table_info(invite_codes)').some((column) => column.name === 'expires_at'));
   migratedDatabase.close();
   const reusedBootstrap = await call('/api/auth/register', {
     body: {
@@ -139,10 +149,20 @@ test('members create markets, place one wager, and receive the correct payout', 
       inviteCode: bootstrapCode,
     },
   });
-  assert.equal(reusedBootstrap.status, 400);
+  assert.equal(reusedBootstrap.status, 201);
 
-  const invitation = await call('/api/invites', { cookie: creator.cookie, body: {} });
+  const invalidDuration = await call('/api/invites', {
+    cookie: creator.cookie,
+    body: { validForDays: 2 },
+  });
+  assert.equal(invalidDuration.status, 400);
+  const invitation = await call('/api/invites', {
+    cookie: creator.cookie,
+    body: { validForDays: 7 },
+  });
   assert.equal(invitation.status, 201);
+  assert.equal(invitation.data.invite.redeemedCount, 0);
+  assert.ok(Date.parse(invitation.data.invite.expiresAt) - Date.now() > 6 * 24 * 60 * 60 * 1000);
 
   const marketResponse = await call('/api/markets', {
     cookie: creator.cookie,
@@ -187,6 +207,37 @@ test('members create markets, place one wager, and receive the correct payout', 
     },
   });
   assert.equal(bettor.status, 201);
+
+  const secondInvitee = await call('/api/auth/register', {
+    body: {
+      username: `c2_${stamp}`,
+      email: `caller2_${stamp}@example.test`,
+      password: 'test-password-123',
+      inviteCode: invitation.data.invite.code,
+    },
+  });
+  assert.equal(secondInvitee.status, 201);
+  const listedInvites = await call('/api/invites', { cookie: creator.cookie });
+  assert.equal(listedInvites.data.invites[0].redeemedCount, 2);
+
+  const expiredInvite = await call('/api/invites', {
+    cookie: creator.cookie,
+    body: { validForDays: 1 },
+  });
+  assert.equal(expiredInvite.status, 201);
+  const expiryDatabase = new Database(databasePath);
+  expiryDatabase.prepare('UPDATE invite_codes SET expires_at = ? WHERE code = ?')
+    .run(new Date(Date.now() - 1000).toISOString(), expiredInvite.data.invite.code);
+  expiryDatabase.close();
+  const expiredRegistration = await call('/api/auth/register', {
+    body: {
+      username: `exp_${stamp}`,
+      email: `expired_${stamp}@example.test`,
+      password: 'test-password-123',
+      inviteCode: expiredInvite.data.invite.code,
+    },
+  });
+  assert.equal(expiredRegistration.status, 400);
 
   const bet = await call(`/api/markets/${marketResponse.data.id}/bets`, {
     cookie: bettor.cookie,

@@ -315,6 +315,8 @@ h1, h2, h3, p { margin-top: 0; }
 .create-dialog-footer > span svg { color: #789353; }
 .create-dialog-footer .dialog-submit { width: auto; min-height: 35px; margin: 0; font-size: 10px; }
 .invite-dialog { width: min(100%, 470px); }
+.invite-duration { display: grid; gap: 6px; margin-bottom: 10px; color: #8b988d; font: 8px var(--mono); }
+.invite-duration select { min-height: 36px; border: 1px solid #e3e9e2; border-radius: 4px; padding: 7px 9px; color: #384b3e; background: #fff; font: 11px 'Manrope', sans-serif; }
 .generate-invite { width: 100%; min-height: 38px; }
 .invite-error { margin-top: 10px; }
 .invite-list-heading { display: flex; justify-content: space-between; margin: 20px 0 8px; color: #8b988d; font: 8px var(--mono); letter-spacing: 0.04em; }
@@ -326,6 +328,7 @@ h1, h2, h3, p { margin-top: 0; }
 .invite-code svg { color: #7b9770; }
 .invite-ready, .invite-used { color: #6c9660; font: 8px var(--mono); }
 .invite-used { color: #a1aaa2; }
+.invite-expiry { margin: -1px 0 6px; color: #8b988d; font-size: 9px; }
 .invite-link-row { display: flex; align-items: center; gap: 5px; }
 .invite-link-row input { min-width: 0; flex: 1; height: 30px; border: 1px solid #e8ede7; border-radius: 3px; background: #fafbf9; color: #78877a; padding: 4px 7px; font: 9px var(--mono); }
 .invite-link-row .icon-button { flex: 0 0 30px; width: 30px; height: 30px; color: #698363; }

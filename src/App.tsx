@@ -23,7 +23,7 @@ import {
 
 type User = { id: number; username: string; balance: number };
 type Leader = User & { wins: number };
-type Invite = { code: string; createdAt: string; redeemedAt: string | null };
+type Invite = { code: string; createdAt: string; expiresAt: string; redeemedCount: number };
 type OptionStat = { count: number; staked: number; odds: number };
 type Bet = { choiceIndex: number; amount: number; odds: number };
 type Market = {
@@ -190,10 +190,10 @@ export default function App() {
     await refresh();
   }
 
-  async function createInvite() {
+  async function createInvite(validForDays: number) {
     const result = await request<{ invite: Invite }>('/api/invites', {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ validForDays }),
     });
     setInvites((current) => [result.invite, ...current]);
     return result.invite;
@@ -696,12 +696,13 @@ function InviteModal({
   onClose,
 }: {
   invites: Invite[];
-  onCreate: () => Promise<Invite>;
+  onCreate: (validForDays: number) => Promise<Invite>;
   onClose: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [copiedCode, setCopiedCode] = useState('');
+  const [validForDays, setValidForDays] = useState('7');
 
   async function copyLink(code: string) {
     const inviteUrl = `${window.location.origin}/?invite=${encodeURIComponent(code)}`;
@@ -718,7 +719,7 @@ function InviteModal({
     setBusy(true);
     setError('');
     try {
-      const invite = await onCreate();
+      const invite = await onCreate(Number(validForDays));
       setCopiedCode('');
       await copyLink(invite.code);
     } catch (requestError) {
@@ -735,7 +736,14 @@ function InviteModal({
         <div className="dialog-mark"><UserRoundPlus size={19} /></div>
         <div className="eyebrow dialog-eyebrow">GROW THE ROOM</div>
         <h2 id="invite-title">Bring someone in.</h2>
-        <p className="dialog-intro">Each invite link opens one account and can only be used once.</p>
+        <p className="dialog-intro">Invite links can be reused until they expire.</p>
+        <label className="invite-duration">VALID FOR
+          <select value={validForDays} onChange={(event) => setValidForDays(event.target.value)}>
+            <option value="1">1 day</option>
+            <option value="7">7 days</option>
+            <option value="30">30 days</option>
+          </select>
+        </label>
         <button className="button button-accent generate-invite" onClick={() => void generateInvite()} disabled={busy}>
           <Plus size={16} />{busy ? 'Making invite...' : 'Create an invite link'}
         </button>
@@ -744,19 +752,20 @@ function InviteModal({
         {invites.length ? (
           <div className="invite-list">
             {invites.map((invite) => {
-              const redeemed = Boolean(invite.redeemedAt);
+              const expired = new Date(invite.expiresAt).getTime() <= Date.now();
               const inviteUrl = `${window.location.origin}/?invite=${encodeURIComponent(invite.code)}`;
               return (
                 <div className="invite-row" key={invite.code}>
-                  <div className="invite-row-top"><span className="invite-code"><Link2 size={13} />{invite.code}</span><span className={redeemed ? 'invite-used' : 'invite-ready'}>{redeemed ? 'USED' : 'READY'}</span></div>
-                  <div className="invite-link-row"><input aria-label={`Invite link ${invite.code}`} readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} /><button className="icon-button" title="Copy invite link" aria-label={`Copy invite ${invite.code}`} disabled={redeemed} onClick={() => void copyLink(invite.code)}>{copiedCode === invite.code ? <Check size={16} /> : <Copy size={15} />}</button></div>
+                  <div className="invite-row-top"><span className="invite-code"><Link2 size={13} />{invite.code}</span><span className={expired ? 'invite-used' : 'invite-ready'}>{expired ? 'EXPIRED' : `${invite.redeemedCount} SIGNUPS`}</span></div>
+                  <div className="invite-expiry">Expires {formatDeadline(invite.expiresAt)}</div>
+                  <div className="invite-link-row"><input aria-label={`Invite link ${invite.code}`} readOnly value={inviteUrl} onFocus={(event) => event.currentTarget.select()} /><button className="icon-button" title="Copy invite link" aria-label={`Copy invite ${invite.code}`} disabled={expired} onClick={() => void copyLink(invite.code)}>{copiedCode === invite.code ? <Check size={16} /> : <Copy size={15} />}</button></div>
                   {copiedCode === invite.code && <div className="invite-copied">Link copied</div>}
                 </div>
               );
             })}
           </div>
         ) : (
-          <div className="invite-empty">No invites yet. Create one link for one new member.</div>
+          <div className="invite-empty">No invites yet. Create a reusable link for new members.</div>
         )}
       </section>
     </div>

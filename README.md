@@ -1,4 +1,4 @@
-# Oddsroom
+# NiggaBet
 
 A community prediction-market website. Members create yes/no or multiple-choice markets, place virtual-credit picks, and settle outcomes after the market closes.
 
@@ -13,14 +13,14 @@ npm run dev
 
 Open `http://localhost:5173`. The API runs on port 3001, and market and account data is shared through the server's SQLite database at `data/oddsroom.sqlite`. People on the same network can use the Vite network URL printed in the terminal while the server is running.
 
-Account creation is invite-only. On a fresh database, the server prints a one-time bootstrap invite code for the first member. Signed-in members can create and copy additional one-use invite links from the **Invite** button.
+Account creation is invite-only. On a fresh database, the server prints a bootstrap invite code, valid for 30 days, for the first member. Signed-in members can create reusable invite links valid for 1, 7, or 30 days from the **Invite** button. Existing invites receive a 30-day grace period when upgrading.
 
 For a production build, run `npm run build` followed by `npm start`. The Express server serves the built site on port 3001. Set `PORT` to change the server port, or `DB_PATH` to choose a different SQLite file.
 
 ## Credit rules
 
 - New accounts receive 1,000 virtual credits.
-- Each account requires its own unused invitation code.
+- Each account requires an unexpired invitation code; a code can be reused until it expires.
 - A member, including the market creator, may place one whole-number stake per market, up to their available balance.
 - Each outcome shows live decimal odds derived from the number of picks: `(total picks + number of outcomes) / (picks on outcome + 1)`. The one-pick prior keeps odds defined when a market is empty.
 - Odds are captured when a pick is placed, so later picks cannot change its payout. The stake is deducted immediately; a winning pick returns `stake × locked odds` in whole credits, rounded down. Losing stakes are not returned.

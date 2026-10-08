@@ -33,7 +33,14 @@ db.exec(`
     created_by INTEGER REFERENCES users(id) ON DELETE CASCADE,
     created_at TEXT NOT NULL,
     redeemed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    redeemed_at TEXT
+    redeemed_at TEXT,
+    expires_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS invite_redemptions (
+    invite_code TEXT NOT NULL REFERENCES invite_codes(code) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    redeemed_at TEXT NOT NULL,
+    PRIMARY KEY (invite_code, user_id)
   );
   CREATE TABLE IF NOT EXISTS markets (
     id TEXT PRIMARY KEY,
@@ -61,6 +68,23 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_bets_market ON bets(market_id);
 `);
 
+const inviteColumns = db.pragma('table_info(invite_codes)');
+if (!inviteColumns.some((column) => column.name === 'expires_at')) {
+  db.exec('ALTER TABLE invite_codes ADD COLUMN expires_at TEXT');
+  const legacyInvites = db.prepare('SELECT code, created_at FROM invite_codes').all();
+  const setInviteExpiry = db.prepare('UPDATE invite_codes SET expires_at = ? WHERE code = ?');
+  const legacyExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  for (const invite of legacyInvites) {
+    setInviteExpiry.run(legacyExpiry, invite.code);
+  }
+}
+
+db.exec(`
+  INSERT OR IGNORE INTO invite_redemptions (invite_code, user_id, redeemed_at)
+  SELECT code, redeemed_by, redeemed_at FROM invite_codes
+  WHERE redeemed_by IS NOT NULL AND redeemed_at IS NOT NULL
+`);
+
 const betColumns = db.pragma('table_info(bets)');
 if (!betColumns.some((column) => column.name === 'decimal_odds')) {
   db.exec('ALTER TABLE bets ADD COLUMN decimal_odds REAL NOT NULL DEFAULT 2.0');
@@ -68,17 +92,24 @@ if (!betColumns.some((column) => column.name === 'decimal_odds')) {
 
 db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(new Date().toISOString());
 const hasUsers = db.prepare('SELECT 1 FROM users LIMIT 1').get();
+const now = new Date().toISOString();
+db.prepare(`
+  DELETE FROM invite_codes
+  WHERE created_by IS NULL AND redeemed_at IS NULL AND expires_at <= ?
+`).run(now);
 const bootstrapInvite = db.prepare(`
-  SELECT code FROM invite_codes WHERE created_by IS NULL AND redeemed_at IS NULL LIMIT 1
-`).get();
+  SELECT code FROM invite_codes WHERE created_by IS NULL AND expires_at > ? LIMIT 1
+`).get(now);
 if (!hasUsers && !bootstrapInvite) {
   const initialInvite = process.env.INITIAL_INVITE_CODE?.trim().toUpperCase()
     || randomBytes(6).toString('hex').toUpperCase();
   if (!/^[A-Z0-9-]{6,32}$/.test(initialInvite)) {
     throw new Error('INITIAL_INVITE_CODE must be 6–32 letters, numbers, or hyphens.');
   }
-  db.prepare('INSERT INTO invite_codes (code, created_at) VALUES (?, ?)')
-    .run(initialInvite, new Date().toISOString());
+  const createdAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO invite_codes (code, created_at, expires_at) VALUES (?, ?, ?)')
+    .run(initialInvite, createdAt, expiresAt);
   console.log(`Bootstrap invite code: ${initialInvite}`);
 }
 
@@ -155,22 +186,19 @@ app.post('/api/auth/register', async (request, response) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = db.transaction(() => {
+      const now = new Date().toISOString();
       const invite = db.prepare(`
-        SELECT code FROM invite_codes WHERE code = ? AND redeemed_at IS NULL
-      `).get(inviteCode);
-      if (!invite) throw Object.assign(new Error('That invitation code is invalid or already used.'), { status: 400 });
+        SELECT code FROM invite_codes WHERE code = ? AND expires_at > ?
+      `).get(inviteCode, now);
+      if (!invite) throw Object.assign(new Error('That invitation code is invalid or expired.'), { status: 400 });
 
       const result = db.prepare(`
         INSERT INTO users (username, email, password_hash, balance, created_at)
         VALUES (?, ?, ?, 1000, ?)
-      `).run(username, email, passwordHash, new Date().toISOString());
-      const redeemed = db.prepare(`
-        UPDATE invite_codes SET redeemed_by = ?, redeemed_at = ?
-        WHERE code = ? AND redeemed_at IS NULL
-      `).run(result.lastInsertRowid, new Date().toISOString(), invite.code);
-      if (redeemed.changes !== 1) {
-        throw Object.assign(new Error('That invitation code is invalid or already used.'), { status: 400 });
-      }
+      `).run(username, email, passwordHash, now);
+      db.prepare(`
+        INSERT INTO invite_redemptions (invite_code, user_id, redeemed_at) VALUES (?, ?, ?)
+      `).run(invite.code, result.lastInsertRowid, now);
       return Number(result.lastInsertRowid);
     })();
     setSession(response, userId);
@@ -210,18 +238,28 @@ app.post('/api/auth/logout', (request, response) => {
 
 app.get('/api/invites', requireUser, (request, response) => {
   const invites = db.prepare(`
-    SELECT code, created_at AS createdAt, redeemed_at AS redeemedAt
-    FROM invite_codes WHERE created_by = ? ORDER BY created_at DESC
+    SELECT invite_codes.code, invite_codes.created_at AS createdAt,
+      invite_codes.expires_at AS expiresAt,
+      COUNT(invite_redemptions.user_id) AS redeemedCount
+    FROM invite_codes
+    LEFT JOIN invite_redemptions ON invite_redemptions.invite_code = invite_codes.code
+    WHERE invite_codes.created_by = ?
+    GROUP BY invite_codes.code ORDER BY invite_codes.created_at DESC
   `).all(request.user.id);
   response.json({ invites });
 });
 
 app.post('/api/invites', requireUser, (request, response) => {
+  const validForDays = Number(request.body.validForDays);
+  if (![1, 7, 30].includes(validForDays)) {
+    return response.status(400).json({ error: 'Choose an invite duration of 1, 7, or 30 days.' });
+  }
   const code = randomBytes(6).toString('hex').toUpperCase();
   const createdAt = new Date().toISOString();
-  db.prepare('INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)')
-    .run(code, request.user.id, createdAt);
-  response.status(201).json({ invite: { code, createdAt, redeemedAt: null } });
+  const expiresAt = new Date(Date.now() + validForDays * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO invite_codes (code, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(code, request.user.id, createdAt, expiresAt);
+  response.status(201).json({ invite: { code, createdAt, expiresAt, redeemedCount: 0 } });
 });
 
 app.get('/api/markets', requireUser, (request, response) => {
